@@ -17,6 +17,7 @@ from load_llff import load_llff_data
 from load_deepvoxels import load_dv_data
 from load_blender import load_blender_data
 from load_LINEMOD import load_LINEMOD_data
+from load_fineview import load_fineview_data
 
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -174,8 +175,84 @@ def render_path(render_poses, hwf, K, chunk, render_kwargs, gt_imgs=None, savedi
 
     return rgbs, disps
 
+def render_path_multi_K(render_poses, hwf, K, chunk, render_kwargs, gt_imgs=None, savedir=None, render_factor=0, eval=False):
 
-def create_nerf(args):
+    H, W, focal = hwf
+
+    if render_factor!=0:
+        # Render downsampled for speed
+        H = H//render_factor
+        W = W//render_factor
+        focal = focal/render_factor
+
+    rgbs = []
+    disps = []
+    
+    if eval:
+        psnrs = []
+        ssims = []
+        lpipses = []
+        from skimage.metrics import structural_similarity
+        import lpips
+        loss_fn_vgg = lpips.LPIPS(net='vgg')
+        def lpips_fn(x, y):
+            '''
+                x: [H,W,3]
+                y: [H,W,3]
+            '''
+            x = torch.from_numpy(x).float().permute(2,0,1).unsqueeze(0)
+            y = torch.from_numpy(y).float().permute(2,0,1).unsqueeze(0)
+
+            loss = loss_fn_vgg(x, y, normalize=True)
+            loss = loss.item()
+            return loss
+
+
+    t = time.time()
+    for i, c2w in enumerate(tqdm(render_poses)):
+        print(i, time.time() - t)
+        t = time.time()
+        rgb, disp, acc, _ = render(H, W, K[i], chunk=chunk, c2w=c2w[:3,:4], **render_kwargs)
+        rgbs.append(rgb.cpu().numpy())
+        disps.append(disp.cpu().numpy())
+        if i==0:
+            print(rgb.shape, disp.shape)
+
+        if eval:
+            if gt_imgs is not None and render_factor==0:
+                out_img = rgb.cpu().numpy()
+                target_img = gt_imgs[i]
+                psnr = -10. * np.log10(np.mean(np.square(out_img - target_img)))
+                ssim = structural_similarity(out_img, target_img, multichannel=True)
+                lpips = lpips_fn(target_img, out_img)
+                psnrs.append(psnr)
+                ssims.append(ssim)
+                lpipses.append(lpips)
+
+        if savedir is not None:
+            rgb8 = to8b(rgbs[-1])
+            filename = os.path.join(savedir, '{:03d}.png'.format(i))
+            imageio.imwrite(filename, rgb8)
+
+    if eval:
+        psnrs = np.array(psnrs)
+        ssims = np.array(ssims)
+        lpipses = np.array(lpipses)
+        avg_psnr = np.mean(psnrs)
+        avg_ssim = np.mean(ssims)
+        avg_lpips = np.mean(lpipses)
+        with open(savedir + "/metrics.txt", mode="w", newline='\n') as f:
+            f.write("Mean PSNR " + str(avg_psnr) +"\n")
+            f.write("Mean SSIM " + str(ssims) +"\n")
+            f.write("Mean LPIPS " + str(lpipses) +"\n")
+
+    rgbs = np.stack(rgbs, 0)
+    disps = np.stack(disps, 0)
+
+    return rgbs, disps
+
+
+def create_nerf(args, expname):
     """Instantiate NeRF's MLP model.
     """
     embed_fn, input_ch = get_embedder(args.multires, args.i_embed)
@@ -208,7 +285,7 @@ def create_nerf(args):
 
     start = 0
     basedir = args.basedir
-    expname = args.expname
+    #expname = args.expname
 
     ##########################
 
@@ -456,6 +533,11 @@ def config_parser():
                         help='do not reload weights from saved ckpt')
     parser.add_argument("--ft_path", type=str, default=None, 
                         help='specific weights npy file to reload for coarse network')
+    #perturbation
+    parser.add_argument("--pose_perturbation", default=False, 
+                        help='pose perturbation')
+    parser.add_argument("--pprate", type=float, default=1e-0, 
+                        help='pose perturbation rate')
 
     # rendering options
     parser.add_argument("--N_samples", type=int, default=64, 
@@ -516,6 +598,12 @@ def config_parser():
     parser.add_argument("--llffhold", type=int, default=8, 
                         help='will take every 1/N images as LLFF test set, paper uses 8')
 
+    ## fineview flags
+    parser.add_argument("--img_number", type=int, default=0, 
+                        help='specie number for fineview dataset')
+    parser.add_argument("--crop", action='store_true', 
+                        help='use crop images')
+
     # logging/saving options
     parser.add_argument("--i_print",   type=int, default=100, 
                         help='frequency of console printout and metric loggin')
@@ -538,6 +626,7 @@ def train():
 
     # Load data
     K = None
+    multi_camera_flag = False
     if args.dataset_type == 'llff':
         images, poses, bds, render_poses, i_test = load_llff_data(args.datadir, args.factor,
                                                                   recenter=True, bd_factor=.75,
@@ -567,8 +656,8 @@ def train():
         print('NEAR FAR', near, far)
 
     elif args.dataset_type == 'blender':
-        images, poses, render_poses, hwf, i_split = load_blender_data(args.datadir, args.half_res, args.testskip)
-        print('Loaded blender', images.shape, render_poses.shape, hwf, args.datadir)
+        images, poses, render_poses, hwf, i_split = load_blender_data(args.datadir, args.half_res, args.testskip, args.pose_perturbation, args.pprate)
+        print('Loaded blender', images.shape, render_poses.shape, hwf, args.datadir, args.pose_perturbation, args.pprate)
         i_train, i_val, i_test = i_split
 
         near = 2.
@@ -603,6 +692,47 @@ def train():
         near = hemi_R-1.
         far = hemi_R+1.
 
+    elif args.dataset_type == 'fineview':
+
+        images, poses, bds, render_poses, i_test, K = load_fineview_data(args.datadir, args.img_number,args.factor,
+                                                                  args.crop, recenter=True, bd_factor=.75,
+                                                                  spherify=args.spherify)
+        '''
+        images, poses, bds, render_poses, i_test = load_fineview_data(args.datadir, args.img_number,args.factor,
+                                                                  recenter=True, bd_factor=0.6,
+                                                                  spherify=args.spherify)
+        '''
+        #breakpoint()
+        if args.white_bkgd:
+            images = images[...,:3]*images[...,-1:] + (1.-images[...,-1:])
+        else:
+            images = images[...,:3]
+
+        hwf = poses[0,:3,-1]
+        poses = poses[:,:3,:4]
+        print('Loaded fineview', images.shape, render_poses.shape, hwf, args.datadir)
+        if not isinstance(i_test, list):
+            i_test = [i_test]
+
+        if args.llffhold > 0:
+            print('Auto LLFF holdout,', args.llffhold)
+            i_test = np.arange(images.shape[0])[::args.llffhold]
+
+        i_val = i_test
+        i_train = np.array([i for i in np.arange(int(images.shape[0])) if
+                        (i not in i_test and i not in i_val)])
+
+        print('DEFINING BOUNDS')
+        if args.no_ndc:
+            near = np.ndarray.min(bds) * .9
+            far = np.ndarray.max(bds) * 1.
+            
+        else:
+            near = 0.
+            far = 1.
+        print('NEAR FAR', near, far)
+        multi_camera_flag = True
+
     else:
         print('Unknown dataset type', args.dataset_type, 'exiting')
         return
@@ -621,10 +751,15 @@ def train():
 
     if args.render_test:
         render_poses = np.array(poses[i_test])
+        if multi_camera_flag:
+            K = np.array(K[i_test])
 
     # Create log dir and copy the config file
     basedir = args.basedir
-    expname = args.expname
+    if args.dataset_type == 'fineview':
+        expname = args.expname + "_" + str(args.img_number).zfill(3) + "_" + str(args.factor)
+    else:
+        expname = args.expname
     os.makedirs(os.path.join(basedir, expname), exist_ok=True)
     f = os.path.join(basedir, expname, 'args.txt')
     with open(f, 'w') as file:
@@ -637,7 +772,7 @@ def train():
             file.write(open(args.config, 'r').read())
 
     # Create nerf model
-    render_kwargs_train, render_kwargs_test, start, grad_vars, optimizer = create_nerf(args)
+    render_kwargs_train, render_kwargs_test, start, grad_vars, optimizer = create_nerf(args,expname)
     global_step = start
 
     bds_dict = {
@@ -660,12 +795,18 @@ def train():
             else:
                 # Default is smoother render_poses path
                 images = None
+                if multi_camera_flag:
+                    K = K[0]
 
             testsavedir = os.path.join(basedir, expname, 'renderonly_{}_{:06d}'.format('test' if args.render_test else 'path', start))
             os.makedirs(testsavedir, exist_ok=True)
             print('test poses shape', render_poses.shape)
 
-            rgbs, _ = render_path(render_poses, hwf, K, args.chunk, render_kwargs_test, gt_imgs=images, savedir=testsavedir, render_factor=args.render_factor)
+            if multi_camera_flag and args.render_test:
+                rgbs, _ = render_path_multi_K(render_poses, hwf, K, args.chunk, render_kwargs_test, gt_imgs=images, savedir=testsavedir, render_factor=args.render_factor, eval=True)
+            else:
+                rgbs, _ = render_path(render_poses, hwf, K, args.chunk, render_kwargs_test, gt_imgs=images, savedir=testsavedir, render_factor=args.render_factor)
+
             print('Done rendering', testsavedir)
             imageio.mimwrite(os.path.join(testsavedir, 'video.mp4'), to8b(rgbs), fps=30, quality=8)
 
@@ -677,7 +818,10 @@ def train():
     if use_batching:
         # For random ray batching
         print('get rays')
-        rays = np.stack([get_rays_np(H, W, K, p) for p in poses[:,:3,:4]], 0) # [N, ro+rd, H, W, 3]
+        if multi_camera_flag:
+            rays = np.stack([get_rays_np(H, W, K[i], poses[i,:3,:4]) for i in range(len(poses[:,:3,:4]))], 0) # [N, ro+rd, H, W, 3]
+        else:
+            rays = np.stack([get_rays_np(H, W, K, p) for p in poses[:,:3,:4]], 0) # [N, ro+rd, H, W, 3]
         print('done, concats')
         rays_rgb = np.concatenate([rays, images[:,None]], 1) # [N, ro+rd+rgb, H, W, 3]
         rays_rgb = np.transpose(rays_rgb, [0,2,3,1,4]) # [N, H, W, ro+rd+rgb, 3]
@@ -802,7 +946,11 @@ def train():
         if i%args.i_video==0 and i > 0:
             # Turn on testing mode
             with torch.no_grad():
-                rgbs, disps = render_path(render_poses, hwf, K, args.chunk, render_kwargs_test)
+                if multi_camera_flag:
+                    #rgbs, disps = render_path_multi_K(render_poses, hwf, K, args.chunk, render_kwargs_test)
+                    rgbs, disps = render_path(render_poses, hwf, K[0], args.chunk, render_kwargs_test)
+                else:
+                    rgbs, disps = render_path(render_poses, hwf, K, args.chunk, render_kwargs_test)
             print('Done, saving', rgbs.shape, disps.shape)
             moviebase = os.path.join(basedir, expname, '{}_spiral_{:06d}_'.format(expname, i))
             imageio.mimwrite(moviebase + 'rgb.mp4', to8b(rgbs), fps=30, quality=8)
@@ -820,7 +968,10 @@ def train():
             os.makedirs(testsavedir, exist_ok=True)
             print('test poses shape', poses[i_test].shape)
             with torch.no_grad():
-                render_path(torch.Tensor(poses[i_test]).to(device), hwf, K, args.chunk, render_kwargs_test, gt_imgs=images[i_test], savedir=testsavedir)
+                if multi_camera_flag:
+                    render_path_multi_K(torch.Tensor(poses[i_test]).to(device), hwf, K[i_test], args.chunk, render_kwargs_test, gt_imgs=images[i_test], savedir=testsavedir)
+                else:
+                    render_path(torch.Tensor(poses[i_test]).to(device), hwf, K, args.chunk, render_kwargs_test, gt_imgs=images[i_test], savedir=testsavedir)
             print('Saved test set')
 
 

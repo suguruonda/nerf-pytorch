@@ -1,5 +1,9 @@
-torch==1.11.0
-torchvision>=0.9.1
+torch
+torchvision
+lpips
+scikit-image
+open3d
+h5py
 imageio
 imageio-ffmpeg
 matplotlib
